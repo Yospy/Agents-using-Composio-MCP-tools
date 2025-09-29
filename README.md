@@ -1,25 +1,96 @@
-# Repository Guidelines
+# Agents using Composio MCP Tools
 
-## Project Structure & Module Organization
-Entry scripts sit in the repo root: `connect.py` onboards Gmail, `github_connect.py` links GitHub, `google_docs_connect.py` handles Google Docs, and `agent.py` replays stored identities. Keep helpers near these scripts until we extract a `src/` package. If you introduce modules, follow `src/<feature>.py` and place integration tests in `tests/`. Environment defaults live in `.env.example`, but each run resolves settings from your local `.env` via `python-dotenv`.
+Automation scripts and agents that use Composio’s MCP tools with OpenAI to operate on Gmail, Google Docs/Drive, GitHub, and Google Calendar. OAuth connections are stored locally so you can reuse identities across runs.
 
-## Build, Test, and Development Commands
-- `python3 -m venv .venv && source .venv/bin/activate`: set up a local virtualenv.
-- `pip install composio openai python-dotenv`: install dependencies; refresh `requirements.txt` when the list changes.
-- `python connect.py`: run Gmail OAuth, store a UUID, and send the canned test mail (uses the full Gmail toolkit).
-- `python github_connect.py [uuid]`: run or reuse GitHub OAuth; positional/flagged UUIDs reuse the same identity and expose every GitHub tool.
-- `python google_docs_connect.py [uuid]`: authorize Google Docs or reuse a stored UUID; the whole Docs toolkit becomes available automatically.
-- `python agent.py <uuid> ["prompt"]`: reuse a UUID and invoke all connected toolkits (Gmail, GitHub, Google Docs, etc.); supply an optional quoted prompt or omit it to send the default email.
+## File Structure
+```
+.
+├── agent.py                     # Google Docs orchestrator agent (LangChain + Composio)
+├── calendar_agent.py            # Google Calendar agent (optimized, LangChain)
+├── connect.py                   # Gmail: connect via OAuth and send a test email
+├── github_connect.py            # GitHub: connect and run a simple task via tools
+├── google_calendar_connect.py   # Google Calendar: connect and save timezone to record
+├── google_docs_connect.py       # Google Docs: connect and run a simple task
+├── mail_agent.py                # Gmail orchestrator agent (LangChain)
+├── tools.py                     # Inspect available tools for a user
+├── outbox/
+│   └── connected_accounts.jsonl # Per‑line records of connected accounts and UUIDs
+├── requirements.txt
+├── .env                         # Local environment (ignored)
+├── .gitignore
+└── README.md
+```
 
-## Coding Style & Naming Conventions
-Work in Python 3.11+, follow PEP 8, and favor explicit imports (`from composio import Composio`). Constants stay upper snake case; environment keys remain uppercase. Run `ruff check .` before submitting; if formatting drifts, apply `ruff format` or `black` to the touched files only.
+## Prerequisites
+- Python 3.11+
+- OpenAI API key and Composio API key
 
-## Testing Guidelines
-We do not yet ship automated tests. When altering flows, add `pytest` suites under `tests/` using `test_<module>.py`. Mock external APIs (Composio, OpenAI) with `pytest-mock` to avoid real calls. Each feature should cover a happy path and a notable failure. Target 80% statement coverage with `pytest --cov=connect`, and document manual validation steps in PRs until coverage improves.
+## Setup
+- Create and activate a virtualenv:
+  - `python3 -m venv .venv && source .venv/bin/activate`
+- Install dependencies:
+  - `pip install -r requirements.txt`
+- Create `.env` in the repo root with at least:
+  ```env
+  # Required
+  COMPOSIO_API_KEY=...
+  OPENAI_API_KEY=...
+  EXTERNAL_USER_ID=you@example.com            # or any stable user UUID
 
-## Commit & Pull Request Guidelines
-History favors concise imperative subjects (`Add Google Docs connector`). Keep the first line under 60 characters and add detail in the body when useful. PRs should link issues, describe the behavior change, list the commands you ran (OAuth flows, agents), and attach screenshots or logs for user-facing effects. Request review and wait for CI once available.
+  # Per‑service Auth Config IDs (from Composio)
+  COMPOSIO_AUTH_CONFIG_ID=...                 # Gmail (used by connect.py)
+  GITHUB_AUTH_CONFIG_ID=...
+  GOOGLE_DOCS_AUTH_CONFIG_ID=...
+  GOOGLE_CALENDAR_AUTH_CONFIG_ID=...
 
-## Environment & Secrets
-Copy `.env.example` to `.env` and fill `COMPOSIO_API_KEY`, `OPENAI_API_KEY`, `COMPOSIO_AUTH_CONFIG_ID`, `GITHUB_AUTH_CONFIG_ID`, `GOOGLE_DOCS_AUTH_CONFIG_ID`, and `EXTERNAL_USER_ID`. Optional overrides like `OPENAI_MODEL`, `EMAIL_SUBJECT`, `EMAIL_BODY`, `GITHUB_TASK`, and `GOOGLE_DOCS_TASK` fine-tune LLM behaviour. Never commit populated `.env` files. When demoing, scope each connected account to the minimum permissions required and rotate shared credentials often.
-# Agents-using-Composio-MCP-tools
+  # Optional
+  OPENAI_MODEL=gpt-4o-mini
+  ACCOUNT_OUTPUT_PATH=outbox/connected_accounts.jsonl
+  TEST_EMAIL_RECIPIENT=you@example.com        # default falls back to EXTERNAL_USER_ID
+  EMAIL_SUBJECT=Hello from Composio
+  EMAIL_BODY=Congrats on your first MCP email!
+  EMAIL_SUMMARY_DAYS=7
+  EMAIL_MAX_RESULTS=25
+  CALENDAR_SUMMARY_DAYS=7
+  CALENDAR_MAX_RESULTS=25
+  CALENDAR_TOOLS_CACHE_TTL_SECONDS=86400
+  ```
+
+## First‑Time Connections (OAuth)
+Records are appended to `outbox/connected_accounts.jsonl` so you can reuse them later with a `record_id`.
+
+- Gmail: `python connect.py`
+  - Prints an OAuth URL; approve access, then it sends a test email and writes a record with a new `record_id`.
+  - Reuse later: `python connect.py --record-id <record_uuid>`
+
+- GitHub: `python github_connect.py [--record-id <record_uuid>] [--task "..."]`
+  - Example: `python github_connect.py --task "List my repos"`
+
+- Google Docs: `python google_docs_connect.py [--record-id <record_uuid>] [--task "..."]`
+  - Example: `python google_docs_connect.py --task "Create a doc named 'Demo'"`
+
+- Google Calendar: `python google_calendar_connect.py [--record-id <record_uuid>]`
+  - Discovers and stores your Calendar timezone when possible.
+
+## Running Agents
+- Gmail agent: `python mail_agent.py <user_or_record_uuid> "Summarize emails from last 7 days" [--model gpt-4o-mini]`
+- Google Docs agent: `python agent.py <user_or_record_uuid> "Create a Google Doc titled 'Weekly Summary'" [--model gpt-4o-mini]`
+- Calendar agent: `python calendar_agent.py <user_or_record_uuid> "List my meetings next week" [--fast] [--debug]`
+
+Notes
+- For all agents, you may pass either the Composio `user_id` (EXTERNAL_USER_ID) or a stored `record_id`. If a `record_id` is provided, the scripts look up the underlying `user_id` and any connected account.
+- Tool availability comes from Composio; if zero tools are returned, verify the correct Auth Config ID and granted scopes in your Composio dashboard.
+
+## Utilities
+- List tools for a user: `python tools.py`
+  - Honors `EXTERNAL_USER_ID` from `.env`. Set `TOOLS_RECORD_ID=<record_uuid>` to scope to a specific record.
+
+## Troubleshooting
+- Missing env var: the scripts fail fast with a message like “Missing COMPOSIO_API_KEY in environment”. Add it to `.env` and retry.
+- No tools returned: ensure the relevant `*_AUTH_CONFIG_ID` is set and the OAuth flow completed successfully. Some environments expose different toolkit slugs; the scripts try common aliases.
+- Calendar timezone not set: rerun `python google_calendar_connect.py` to attempt discovery, or set a timezone hint in your prompt when using the agent.
+- Reusing identities: pass `--record-id <record_uuid>` to the connector scripts, or pass `<record_uuid>` to the agents.
+
+## Notes
+- Connection records are stored in `outbox/connected_accounts.jsonl`. One JSON object per line with fields like `record_id`, `service`, `connected_account_id`, and `user_id`.
+- `.env` is ignored by git by default; keep secrets out of version control.
