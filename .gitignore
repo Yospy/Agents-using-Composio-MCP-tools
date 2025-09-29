@@ -1,2 +1,5 @@
 # Environment variables
 .env
+
+# Local connection records / sensitive outbox data
+outbox/connected_accounts.jsonl
