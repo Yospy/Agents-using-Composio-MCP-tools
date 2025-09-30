@@ -11,15 +11,14 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-# Prepare Composio runtime: cache dir + suppress telemetry thread tracebacks
+# Ensure a writable Composio cache directory and suppress telemetry thread tracebacks
 _cache_dir = os.getenv("COMPOSIO_CACHE_DIR")
 if not _cache_dir:
-    from pathlib import Path as _P
-    _local = _P(".composio_cache").resolve()
+    _local = Path(".composio_cache").resolve()
     _local.mkdir(parents=True, exist_ok=True)
     os.environ["COMPOSIO_CACHE_DIR"] = str(_local)
 
-def _thread_hook(args: threading.ExceptHookArgs):
+def _composio_thread_excepthook(args: threading.ExceptHookArgs):
     try:
         tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
     except Exception:
@@ -29,20 +28,30 @@ def _thread_hook(args: threading.ExceptHookArgs):
         return
     sys.__excepthook__(args.exc_type, args.exc_value, args.exc_traceback)
 
-threading.excepthook = _thread_hook
+threading.excepthook = _composio_thread_excepthook
 
 from composio import Composio
 from openai import OpenAI
+
+
 load_dotenv()
 
 DEFAULT_OUTPUT_PATH = Path(
     os.getenv("ACCOUNT_OUTPUT_PATH", "outbox/connected_accounts.jsonl")
 )
-GOOGLE_DOCS_TOOLKITS = ["GOOGLEDOCS"]
+
+# Try common toolkit slugs for Notion
+NOTION_TOOLKIT_CANDIDATES: list[str] = [
+    "NOTION",
+    "NOTIONHQ",
+    "NOTION_DB",
+    "NOTIONDATABASES",
+]
+
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 DEFAULT_TASK = os.getenv(
-    "GOOGLE_DOCS_TASK",
-    "What Google Docs actions can you perform for this user?",
+    "NOTION_TASK",
+    "What Notion actions can you perform for this user?",
 )
 PROMPT_TEMPLATE = (
     "{task} Capture the tracking ID {tracking_id} in any updates you write."
@@ -51,7 +60,7 @@ PROMPT_TEMPLATE = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Authorize Google Docs via Composio and run a simple tool-enabled task."
+        description="Authorize Notion via Composio and run a simple tool-enabled task."
     )
     parser.add_argument(
         "record_id",
@@ -65,12 +74,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--task",
-        help="Override the default Google Docs agent task.",
+        help="Override the default Notion agent task.",
     )
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
         help=f"OpenAI model to invoke (default: {DEFAULT_MODEL}).",
+    )
+    parser.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=int(os.getenv("OAUTH_WAIT_SECONDS", "240")),
+        help="How long to wait for OAuth to complete before timing out (default: 240).",
     )
     return parser.parse_args()
 
@@ -141,7 +156,7 @@ def main() -> None:
 
     composio_api_key = require_env("COMPOSIO_API_KEY")
     openai_api_key = require_env("OPENAI_API_KEY")
-    auth_config_id = os.getenv("GOOGLE_DOCS_AUTH_CONFIG_ID")
+    auth_config_id = os.getenv("NOTION_AUTH_CONFIG_ID")
 
     record_id_positional = args.record_id
     record_id_flag = getattr(args, "record_id_flag", None)
@@ -155,22 +170,22 @@ def main() -> None:
         external_user_id = select_user_id(existing_records) or require_env("EXTERNAL_USER_ID")
         requested_toolkits = select_toolkits(
             existing_records,
-            service="google_docs",
-            fallback=GOOGLE_DOCS_TOOLKITS,
+            service="notion",
+            fallback=NOTION_TOOLKIT_CANDIDATES,
         )
-        docs_record = next(
-            (rec for rec in existing_records if rec.get("service") == "google_docs"),
+        notion_record = next(
+            (rec for rec in existing_records if rec.get("service") == "notion"),
             None,
         )
-        reuse_connection = docs_record is not None
+        reuse_connection = notion_record is not None
         if not reuse_connection and not auth_config_id:
-            auth_config_id = require_env("GOOGLE_DOCS_AUTH_CONFIG_ID")
+            auth_config_id = require_env("NOTION_AUTH_CONFIG_ID")
     else:
         record_id = str(uuid.uuid4())
         external_user_id = require_env("EXTERNAL_USER_ID")
-        requested_toolkits = GOOGLE_DOCS_TOOLKITS
+        requested_toolkits = NOTION_TOOLKIT_CANDIDATES
         if not auth_config_id:
-            auth_config_id = require_env("GOOGLE_DOCS_AUTH_CONFIG_ID")
+            auth_config_id = require_env("NOTION_AUTH_CONFIG_ID")
         existing_records = []
         reuse_connection = False
 
@@ -182,15 +197,31 @@ def main() -> None:
             auth_config_id=auth_config_id,
         )
         redirect_url = connection_request.redirect_url
-        print(f"Please authorize Google Docs access by visiting this URL: {redirect_url}")
-        connected_account = connection_request.wait_for_connection()
         print(
-            "Google Docs connection established successfully! Connected account id: "
+            "Please authorize Notion access by visiting this URL: {url}\n"
+            "[i] Connection session id: {sid}"
+            .format(url=redirect_url, sid=getattr(connection_request, "id", "<unknown>"))
+        )
+        try:
+            connected_account = connection_request.wait_for_connection(timeout=args.wait_seconds)
+        except Exception as e:
+            # Provide a clearer hint on common causes like timeouts
+            msg = str(e)
+            print(
+                "[error] Waiting for Notion OAuth confirmation failed: {msg}\n"
+                "- Ensure you completed the browser authorization flow.\n"
+                "- If it timed out, rerun with a larger wait: --wait-seconds 600.\n"
+                "- Also verify NOTION_AUTH_CONFIG_ID points to a valid Composio auth config (usually starts with 'ac_')."
+                .format(msg=msg)
+            )
+            raise
+        print(
+            "Notion connection established successfully! Connected account id: "
             f"{connected_account.id}"
         )
         record = {
             "record_id": record_id,
-            "service": "google_docs",
+            "service": "notion",
             "connected_account_id": connected_account.id,
             "user_id": external_user_id,
             "auth_config_id": auth_config_id,
@@ -199,7 +230,7 @@ def main() -> None:
         }
         write_record(record, DEFAULT_OUTPUT_PATH)
         print(
-            "Stored Google Docs connection {record} for user {user} at {path}".format(
+            "Stored Notion connection {record} for user {user} at {path}".format(
                 record=record_id,
                 user=external_user_id,
                 path=DEFAULT_OUTPUT_PATH,
@@ -207,13 +238,31 @@ def main() -> None:
         )
     else:
         print(
-            "Reusing existing Google Docs connection for record {record}".format(
+            "Reusing existing Notion connection for record {record}".format(
                 record=record_id,
             )
         )
 
-    tools = composio.tools.get(user_id=external_user_id, toolkits=requested_toolkits)
+    # Attempt to resolve available Notion tools using candidate slugs
+    tools = []
+    used_slug = None
+    for slug in NOTION_TOOLKIT_CANDIDATES:
+        try:
+            tools = composio.tools.get(user_id=external_user_id, toolkits=[slug])
+        except Exception:
+            tools = []
+        if tools:
+            used_slug = slug
+            break
 
+    if used_slug:
+        print(f"[i] Notion tools resolved via '{used_slug}': {len(tools)} tools available")
+    else:
+        print(
+            "[warn] No Notion tools returned; verify toolkit slug and permissions in Composio."
+        )
+
+    # Optional demo: invoke model with tools enabled
     openai_client = OpenAI(api_key=openai_api_key)
     task = args.task or DEFAULT_TASK
     user_prompt = PROMPT_TEMPLATE.format(task=task, tracking_id=record_id)
@@ -225,8 +274,8 @@ def main() -> None:
             {
                 "role": "system",
                 "content": (
-                    "You are a Google Docs integration agent. Choose actions responsibly and "
-                    "include the provided tracking ID in any document updates."
+                    "You are a Notion integration agent. Choose actions responsibly and "
+                    "include the provided tracking ID in any updates."
                 ),
             },
             {"role": "user", "content": user_prompt},
@@ -238,7 +287,7 @@ def main() -> None:
         user_id=external_user_id,
     )
     print(json.dumps(result, indent=2))
-    print("Google Docs agent task completed.")
+    print("Notion agent task completed.")
 
 
 if __name__ == "__main__":

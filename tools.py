@@ -1,5 +1,8 @@
 import json
 import os
+import sys
+import threading
+import traceback
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -16,6 +19,27 @@ CACHE_DIR = Path(os.getenv("COMPOSIO_CACHE_DIR", WORKDIR / ".composio_cache")).r
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("COMPOSIO_CACHE_DIR", str(CACHE_DIR))
 
+def _prep_composio_env():
+    cache_dir = os.getenv("COMPOSIO_CACHE_DIR")
+    if not cache_dir:
+        local = Path(".composio_cache").resolve()
+        local.mkdir(parents=True, exist_ok=True)
+        os.environ["COMPOSIO_CACHE_DIR"] = str(local)
+
+    def _thread_hook(args: threading.ExceptHookArgs):
+        try:
+            tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        except Exception:
+            tb = ""
+        name = getattr(args.thread, "name", "")
+        if "_thread_loop" in name and "composio/core/models/_telemetry" in tb:
+            return
+        sys.__excepthook__(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = _thread_hook
+
+_prep_composio_env()
+
 from composio import Composio  # noqa: E402
 
 DEFAULT_OUTPUT_PATH = Path(os.getenv("ACCOUNT_OUTPUT_PATH", WORKDIR / "outbox/connected_accounts.jsonl"))
@@ -24,6 +48,7 @@ SERVICE_TOOLKITS = {
     "gmail": ["GMAIL"],
     "github": ["GITHUB"],
     "google_docs": ["GOOGLEDOCS"],
+    "notion": ["NOTION"],
 }
 
 # Some environments expose slightly different toolkit slugs; try fallbacks.
@@ -49,6 +74,23 @@ TOOLKIT_SYNONYMS: dict[str, list[str]] = {
         "DOCS",
         "GOOGLE_DRIVE",
         "GOOGLE",
+    ],
+    # Google Calendar synonyms
+    "GOOGLECALENDAR": [
+        "GOOGLECALENDAR",
+        "GOOGLE_CALENDAR",
+        "CALENDAR",
+    ],
+    # Notion synonyms across environments
+    "NOTION": [
+        "NOTION",
+        "NOTIONHQ",
+        "NOTION_DB",
+        "NOTIONDATABASES",
+        "NOTION_DATABASE",
+        "NOTIONDATABASE",
+        "NOTION_PAGES",
+        "NOTIONPAGES",
     ],
 }
 

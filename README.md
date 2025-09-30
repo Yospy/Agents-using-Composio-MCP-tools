@@ -9,6 +9,7 @@ Automation scripts and agents that use Composio’s MCP tools with OpenAI to ope
 ├── calendar_agent.py            # Google Calendar agent (optimized, LangChain)
 ├── connect.py                   # Gmail: connect via OAuth and send a test email
 ├── github_connect.py            # GitHub: connect and run a simple task via tools
+├── notion_connect.py            # Notion: connect and run a simple task via tools
 ├── google_calendar_connect.py   # Google Calendar: connect and save timezone to record
 ├── google_docs_connect.py       # Google Docs: connect and run a simple task
 ├── mail_agent.py                # Gmail orchestrator agent (LangChain)
@@ -42,6 +43,10 @@ Automation scripts and agents that use Composio’s MCP tools with OpenAI to ope
   GITHUB_AUTH_CONFIG_ID=...
   GOOGLE_DOCS_AUTH_CONFIG_ID=...
   GOOGLE_CALENDAR_AUTH_CONFIG_ID=...
+  NOTION_AUTH_CONFIG_ID=...
+  
+  # Optional: cache location override (scripts set a safe default automatically)
+  COMPOSIO_CACHE_DIR=.composio_cache
 
   # Optional
   OPENAI_MODEL=gpt-4o-mini
@@ -71,6 +76,9 @@ Records are appended to `outbox/connected_accounts.jsonl` so you can reuse them 
 
 - Google Calendar: `python google_calendar_connect.py [--record-id <record_uuid>]`
   - Discovers and stores your Calendar timezone when possible.
+
+- Notion: `python notion_connect.py [--record-id <record_uuid>] [--task "..."]`
+  - Example: `python notion_connect.py --task "List my pages and databases"`
 
 ## Running Agents
 - Gmail agent: `python mail_agent.py <user_or_record_uuid> "Summarize emails from last 7 days" [--model gpt-4o-mini]`

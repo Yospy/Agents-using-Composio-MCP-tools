@@ -3,6 +3,10 @@ import base64
 import html
 import json
 import os
+import sys
+import threading
+import traceback
+import time
 import quopri
 import re
 from pathlib import Path
@@ -10,12 +14,28 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+def _install_thread_excepthook():
+    def _hook(args: threading.ExceptHookArgs):
+        try:
+            tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        except Exception:
+            tb = ""
+        name = getattr(args.thread, "name", "")
+        if "_thread_loop" in name and "composio/core/models/_telemetry" in tb:
+            return
+        sys.__excepthook__(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = _hook
+
+_install_thread_excepthook()
+
 from composio import Composio
 
 from langchain.agents import AgentExecutor, create_openai_functions_agent
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import BaseTool
+from langchain_core.callbacks import BaseCallbackHandler
 
 
 # Ensure a writable cache path for Composio
@@ -34,31 +54,40 @@ FALLBACK_PROMPT = os.getenv(
 )
 
 
+SYSTEM_PROMPT_TEMPLATE = """
+You are a Gmail Orchestrator Agent with access to Composio MCP tools for Gmail only.
+Interpret user instructions, choose the correct Gmail tool, and produce a concise outcome.
+
+## Identity
+- The user is identified by a UUID provided at runtime.
+- Act only on behalf of this user's connected Gmail account; use user_id='me' for Gmail API calls.
+
+## Rules
+1. Use only the exposed Gmail tools (names start with GMAIL_). Do not fabricate results.
+2. For search/summarize tasks, build a Gmail query as needed and request at most %%EMAIL_MAX_RESULTS%% results (set max_results accordingly). Exclude drafts unless the user requests drafts.
+   - If nextPageToken is returned, continue until the requested count is met or the token is absent.
+3. When retrieving messages, you will receive only subject and body (plain text). The body is already decoded and trimmed by the runtime.
+4. Summaries must be a point-wise list: one bullet per email (up to %%EMAIL_MAX_RESULTS%%). Each bullet should start with the subject, then a short gist from the body.
+   - Keep each bullet to one line when possible.
+5. When asked to send an email, call the appropriate Gmail send tool and provide all required parameters from the user prompt (do not invent recipients).
+6. Output only the user-facing result (no JSON or tool traces).
+7. If there are no recent emails, reply: 'No recent emails to summarize.'
+
+## Generalized Input Schema (Guidance)
+- Always follow the exact JSON schema of the selected GMAIL_* tool.
+- Use these conventions when mapping natural language to tool arguments (only if the tool schema matches):
+  • Send (e.g., GMAIL_SEND_*): {recipient_email: string, subject: string, body: string, cc?: string[], bcc?: string[], is_html?: boolean}. Do not fabricate recipients.
+  • Search/List (e.g., GMAIL_FETCH_*/GMAIL_SEARCH_*): {query: string, max_results?: number ≤ %%EMAIL_MAX_RESULTS%%}. Prefer queries like newer_than:%%EMAIL_SUMMARY_DAYS%%d and exclude drafts unless asked.
+  • Read (e.g., GMAIL_GET_MESSAGE/GMAIL_GET_THREAD): {id: string}.
+- The runtime automatically supplies authentication context (user_id). Do not include it.
+- If the tool exposes cc/bcc arrays, pass arrays of strings (not comma-joined).
+- If the body contains HTML and the tool supports it, set is_html = true.
+"""
+
 SYSTEM_PROMPT = (
-    "You are a Gmail Orchestrator Agent with access to Composio MCP tools for Gmail only.\n"
-    "Interpret user instructions, choose the correct Gmail tool, and produce a concise outcome.\n\n"
-    "## Identity\n"
-    "- The user is identified by a UUID provided at runtime.\n"
-    "- Act only on behalf of this user's connected Gmail account; use user_id='me' for Gmail API calls.\n\n"
-    "## Rules\n"
-    "1. Use only the exposed Gmail tools (names start with GMAIL_). Do not fabricate results.\n"
-    f"2. For search/summarize tasks, build a Gmail query as needed and request at most {EMAIL_MAX_RESULTS} results (set max_results accordingly). Exclude drafts unless the user requests drafts.\n"
-    "   - If nextPageToken is returned, continue until the requested count is met or the token is absent.\n"
-    "3. When retrieving messages, you will receive only subject and body (plain text). The body is already decoded and trimmed by the runtime.\n"
-    f"4. Summaries must be a point-wise list: one bullet per email (up to {EMAIL_MAX_RESULTS}). Each bullet should start with the subject, then a short gist from the body.\n"
-    "   - Keep each bullet to one line when possible.\n"
-    "5. When asked to send an email, call the appropriate Gmail send tool and provide all required parameters from the user prompt (do not invent recipients).\n"
-    "6. Output only the user-facing result (no JSON or tool traces).\n"
-    "7. If there are no recent emails, reply: 'No recent emails to summarize.'\n"
-    "\n## Generalized Input Schema (Guidance)\n"
-    "- Always follow the exact JSON schema of the selected GMAIL_* tool.\n"
-    "- Use these conventions when mapping natural language to tool arguments (only if the tool schema matches):\n"
-    "  • Send (e.g., GMAIL_SEND_*): {recipient_email: string, subject: string, body: string, cc?: string[], bcc?: string[], is_html?: boolean}. Do not fabricate recipients.\n"
-    f"  • Search/List (e.g., GMAIL_FETCH_*/GMAIL_SEARCH_*): {{query: string, max_results?: number ≤ {EMAIL_MAX_RESULTS}}}. Prefer queries like newer_than:{EMAIL_SUMMARY_DAYS}d and exclude drafts unless asked.\n"
-    "  • Read (e.g., GMAIL_GET_MESSAGE/GMAIL_GET_THREAD): {id: string}.\n"
-    "- The runtime automatically supplies authentication context (user_id). Do not include it.\n"
-    "- If the tool exposes cc/bcc arrays, pass arrays of strings (not comma-joined).\n"
-    "- If the body contains HTML and the tool supports it, set is_html = true.\n"
+    SYSTEM_PROMPT_TEMPLATE
+    .replace("%%EMAIL_MAX_RESULTS%%", str(EMAIL_MAX_RESULTS))
+    .replace("%%EMAIL_SUMMARY_DAYS%%", str(EMAIL_SUMMARY_DAYS))
 )
 
 
@@ -375,6 +404,71 @@ class GmailTool(BaseTool):
 
         normalized = normalize_gmail_output(payload)
         return _safe_json({"status": "success", "action": self.slug, "result": normalized})
+
+
+class StepLogger(BaseCallbackHandler):
+    """Logs LLM and tool steps with latencies by default (no --debug flag).
+
+    Safe to attach via callbacks=[StepLogger()] on chain/agent invocations.
+    """
+
+    def __init__(self) -> None:
+        self._tool_start: dict[object, float] = {}
+        self._llm_start: dict[object, float] = {}
+        self.tool_total: float = 0.0
+        self.llm_total: float = 0.0
+        self.tool_calls: int = 0
+
+    # LLM timings
+    def on_llm_start(self, serialized, prompts, **kwargs):  # type: ignore[no-untyped-def]
+        run_id = kwargs.get("run_id") or id(prompts)
+        self._llm_start[run_id] = time.perf_counter()
+        try:
+            n = len(prompts) if isinstance(prompts, (list, tuple)) else 1
+        except Exception:
+            n = 1
+        print(f"[llm] start ({n} prompt{'s' if n != 1 else ''})")
+
+    def on_llm_end(self, response, **kwargs):  # type: ignore[no-untyped-def]
+        run_id = kwargs.get("run_id") or id(response)
+        t0 = self._llm_start.pop(run_id, None)
+        if t0 is not None:
+            dt = time.perf_counter() - t0
+            self.llm_total += dt
+            print(f"[llm] done in {dt:.2f}s")
+
+    # Tool timings
+    def on_tool_start(self, serialized, input_str, **kwargs):  # type: ignore[no-untyped-def]
+        run_id = kwargs.get("run_id") or id(input_str)
+        self._tool_start[run_id] = time.perf_counter()
+        name = None
+        if isinstance(serialized, dict):
+            name = serialized.get("name")
+        name = name or "<tool>"
+        try:
+            inp = input_str if isinstance(input_str, str) else json.dumps(input_str)
+        except Exception:
+            inp = str(input_str)
+        if isinstance(inp, str) and len(inp) > 500:
+            inp = inp[:500] + "…"
+        print(f"[tool] {name} -> {inp}")
+
+    def on_tool_end(self, output, **kwargs):  # type: ignore[no-untyped-def]
+        run_id = kwargs.get("run_id") or id(output)
+        t0 = self._tool_start.pop(run_id, None)
+        try:
+            out = output if isinstance(output, str) else json.dumps(output)
+        except Exception:
+            out = str(output)
+        if isinstance(out, str) and len(out) > 300:
+            out = out[:300] + "…"
+        if t0 is not None:
+            dt = time.perf_counter() - t0
+            self.tool_total += dt
+            self.tool_calls += 1
+            print(f"[tool] done in {dt:.2f}s -> {out}")
+        else:
+            print(f"[tool] done -> {out}")
 
 
 def build_prompt_template(system_prompt: str) -> ChatPromptTemplate:

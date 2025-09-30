@@ -1,11 +1,29 @@
 import argparse
 import json
 import os
+import sys
+import threading
+import traceback
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+
+def _install_thread_excepthook():
+    def _hook(args: threading.ExceptHookArgs):
+        try:
+            tb = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        except Exception:
+            tb = ""
+        name = getattr(args.thread, "name", "")
+        if "_thread_loop" in name and "composio/core/models/_telemetry" in tb:
+            return
+        sys.__excepthook__(args.exc_type, args.exc_value, args.exc_traceback)
+
+    threading.excepthook = _hook
+
+_install_thread_excepthook()
 
 from composio import Composio
 
